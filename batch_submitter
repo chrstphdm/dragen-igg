@@ -1,0 +1,192 @@
+#!/bin/bash
+set -eo pipefail
+############################################################
+#
+# DESCRIPTION
+#
+## This script is a batcher for the dragen-igg wrapper.
+## Some defaults ENV variables are loaded dependantly of the place
+## where it is launched (TEST|PROD). 
+#
+#
+# INPUT
+#
+## $1: YAML_[FILE|FOLDER], an OUTPUT_NXF_YAML_DIR generated with create_batches 
+##     wrapper. Should be like */COHORTS/*/CONFIG/NEXTFLOW_YAML.
+##     You can use relative & abslute path. MANDATORY
+#
+#
+# OUTPUT
+#
+## * creation of INSTANCE_DIR : ${LOGS_ROOT_PATH}/INSTANCE-${TODAY}
+## * creation of a log file   : ${INSTANCE_DIR}/${SELF_SCRIPT_NAME}.log
+#
+############################################################
+
+SELF_SCRIPT_NAME=$(basename "$0")
+TODAY=$(date +"%Y%m%d_%H%M%S")
+
+#####################################################
+## let's check who we are
+if [[ "$(whoami)" != 'my_org_bioinfoadmin' ]]
+then
+	echo "ERROR: You must run this script as my_org_bioinfoadmin user!" >&2
+	exit 1;
+fi
+
+#####################################################
+## let's check on which node we are
+if [[ "$(hostname)" != 'ngslogin1' ]]
+then
+    echo "ERROR: You must run this script from ngslogin1 !" >&2
+	exit 1;
+fi
+
+#####################################################
+## let's check where we are
+if [ -z "${DRAGEN_IGG_DIR}" ]; then
+    DRAGEN_IGG_DIR=$(dirname "$(realpath "${BASH_SOURCE[0]}")")
+fi
+
+#####################################################
+# loading env variables 
+if [[ $(pwd) =~ [Tt][Ee][Ss][Tt][Ss]? ]]; then
+    source "${DRAGEN_IGG_DIR}/assets/tests.env"
+    echo "-------------------------------------"
+    echo "TEST MODE (because of location [$(pwd)]): "
+    echo -e "\t"
+else
+    source "${DRAGEN_IGG_DIR}/assets/production.env"
+fi
+
+#####################################################
+## just some verifications
+env_vars=("DATA_ROOT_PATH" "OUTPUT_REPO" "PREAGG_DIR" "AGG_DIR" "BATCH_SIZE" "LOGS_ROOT_PATH")
+for var in "${env_vars[@]}"; do
+    if [ -z "${!var}" ]; then
+        echo "ERROR: environment variable '${var}' is not correctly initialized. Contact the administrator." >&2
+        exit 1
+    else
+        echo -e "\t${var}=[${!var}]"
+    fi
+done
+
+########################################################################
+## need to check if the $1 is ok and check what type is it.
+yaml_file=$1
+declare -a yamls_list=()
+if [[ -n "${yaml_file}" ]]; then
+    if [[ -d "${yaml_file}" ]]; then
+        ## this is a folder
+        echo "-------------------------------------"
+        echo "INFO: Directory provided : ${yaml_file}";
+        echo "INFO: Scanning for YAML files...";
+        shopt -s nullglob 
+        for file in "${yaml_file}"/*.yaml; do
+            if [[ ! -e "${file}.RUNNING" && ! -e "${file}.OK" && ! -e "${file}.ERROR" ]]; then
+                yamls_list+=($(realpath "${file}"))
+            fi
+        done
+        for file in "${yaml_file}"/*.yaml.RUNNING; do
+            yamls_list_running+=($(realpath "${file}"))
+        done
+        for file in "${yaml_file}"/*.yaml.ERROR; do
+            yamls_list_error+=($(realpath "${file}"))
+        done
+        for file in "${yaml_file}"/*.yaml.OK; do
+            yamls_list_ok+=($(realpath "${file}"))
+        done
+        shopt -u nullglob
+    elif [[ -f "${yaml_file}" && -r "${yaml_file}" && -s "${yaml_file}" ]]; then
+        ## this is a file
+        echo "-------------------------------------"
+        echo "INFO: Single YAML file provided: ${yaml_file}";
+        if [[ -f "${yaml_file}.RUNNING" ]] ; then
+            yamls_list_running+=($(realpath "${yaml_file}"))
+        elif [[ -f "${yaml_file}.ERROR" ]] ; then
+            yamls_list_error+=($(realpath "${yaml_file}"))
+        elif [[ -f "${yaml_file}.OK" ]] ; then
+            yamls_list_ok+=($(realpath "${yaml_file}"))
+        else
+            yamls_list+=(${yaml_file})
+        fi
+    else
+        echo "ERROR: The file/folder [${yaml_file}] does not exist, is not readable, or is empty." >&2
+        exit 1
+    fi
+else
+    echo "ERROR: No argument YAML_[FILE|FOLDER] was found or specified. It is MANDATORY" >&2
+    exit 1
+fi
+
+########################################################################
+number_of_yaml=${#yamls_list[@]}
+number_of_yaml_ok=${#yamls_list_ok[@]}
+number_of_yaml_running=${#yamls_list_running[@]}
+number_of_yaml_error=${#yamls_list_error[@]}
+echo -e "\tfound [$number_of_yaml_ok], YAML files OK"
+echo -e "\tfound [$number_of_yaml_running], YAML files RUNNING"
+echo -e "\tfound [$number_of_yaml_error], YAML files ERROR"
+if [ "$number_of_yaml" -eq 0 ]; then
+	echo "WARN: NO YAML files ready to analyse, have to quit."
+	exit 0;
+else
+    echo -e "\tfound [$number_of_yaml], YAML files TO_ANALYSE"
+    # Ask a yes/no question
+    echo "Do you want to continue? (yes/no)"
+    read -r answer
+    # Check the response
+    if [[ "$answer" == "no" ]]; then
+        echo "WARN: Nothing to do.....Exiting the script."
+        exit 0
+    elif [[ "$answer" == "yes" ]]; then
+        echo "Continuing the script..."
+    else
+        echo "ERROR: Invalid response. Please answer 'yes' or 'no'." >&2
+        exit 1
+    fi
+fi
+
+########################################################################
+## set the ENV variables
+TODAY=$(date +"%Y%m%d_%H%M%S")
+export TODAY
+INSTANCE_DIR="${LOGS_ROOT_PATH}/${SELF_SCRIPT_NAME}/INSTANCE-${TODAY}"
+mkdir -p "${INSTANCE_DIR}"
+INSTANCE_LOG="${INSTANCE_DIR}/${SELF_SCRIPT_NAME}.log"
+
+for yaml_entry in "${yamls_list[@]}"; do
+	echo "YAML: $yaml_entry" | tee -a "${INSTANCE_LOG}"
+	if [[ -r $yaml_entry && -f $yaml_entry ]]; then
+        if ls "${yaml_entry}."* 1> /dev/null 2>&1; then
+            echo "ERROR: a param-file [${yaml_entry}.*] FLAG have been detected. Remove it before running again." | tee -a "${INSTANCE_LOG}"
+        else
+            # Construct the base name for the YAML file from its path
+            yaml_basename="${INSTANCE_DIR}/$(basename "${yaml_entry}")"
+
+            # Command definition for reuse
+            command="export TODAY='${TODAY}'; export SUFFIX_LOGS_PATH='${SELF_SCRIPT_NAME}/INSTANCE-${TODAY}'; ${DRAGEN_IGG_DIR}/dragen-igg -params-file $yaml_entry"
+
+            # Log the command to be executed and its echo to the instance log
+            echo "COMMAND:" | tee -a "$INSTANCE_LOG"
+            echo "${command}" | tee -a "$INSTANCE_LOG"
+
+            # Submit the command to the LSF job scheduler
+            bsub_output="${yaml_basename}.LSF.%J.out"
+            bsub_error="${yaml_basename}.LSF.%J.err"
+            bsub -q my_org-production -P Agg -n 1 -o "${bsub_output}" -e "${bsub_error}" <<< "${command}"
+            BSUB_EXIT_CODE=$?
+            # Check if the submission was successful
+            if [ $BSUB_EXIT_CODE -eq 0 ]; then
+                echo -e "\tsubmission OK"
+            else
+                echo -e "\tsubmission NOK"
+            fi
+            # Decorative separator for clarity in logs
+            echo "-------------------------------------" | tee -a "$INSTANCE_LOG"
+        fi
+	else
+		echo "WARN: File [$yaml_entry] should be in YAML format and readable" | tee -a "${INSTANCE_LOG}"
+	fi
+    echo "INFO: logs in [${INSTANCE_LOG}]"
+done

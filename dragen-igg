@@ -1,0 +1,217 @@
+#!/bin/bash
+############################################################
+#
+# DESCRIPTION
+#
+## This script is a wrapper for the dragen-igg nextflow pipeline.
+## Some defaults ENV variables are loaded dependantly of the place
+## where it is launched (TEST|PROD). 
+#
+#
+# INPUT
+#
+## * -params-file PATH_NEXTFLOW_YAML_FILE : Batch file in YAML format specialy generated for nextflow
+## * any other nextflow OPTION is acceptable
+#
+#
+# OUTPUT
+#
+## * creation of INSTANCE_DIR : ${LOGS_ROOT_PATH}/INSTANCE-${TODAY}
+## * creation of nextflow log : ${INSTANCE_DIR}/${SELF_SCRIPT_NAME}-${yaml_filename}.nextflow.log
+## * creation of a flagfile   : ${INSTANCE_DIR}/${SELF_SCRIPT_NAME}-${yaml_filename}.[RUNNING|ERROR|OK]
+## * creation of a flagfile   : ${PATH_NEXTFLOW_YAML_FILE}.[RUNNING|ERROR|OK]
+#
+############################################################
+
+
+#####################################################
+## this is the function called if a signal is trapped
+cleanup() {
+    #####################################################
+    echo "EMERGENCY_CLEAN_UP: User interruption detected..."                    | tee -a "${NXF_INSTANCE_RUNNING}"
+    echo "EMERGENCY_CLEAN_UP: Cleaning nextflow process..."                     | tee -a "${NXF_INSTANCE_RUNNING}"
+    kill -SIGTERM "${NEXTFLOW_PID}"
+    echo "EMERGENCY_CLEAN_UP: Waiting to close the stdout/err..."               | tee -a "${NXF_INSTANCE_RUNNING}"
+    wait "${TEEPID1}" "${TEEPID2}"
+
+    echo "EMERGENCY_CLEAN_UP: Creating error flag..."                           | tee -a "${NXF_INSTANCE_RUNNING}"
+    cat "${NXF_INSTANCE_RUNNING}" > "${NXF_INSTANCE_ERROR}"
+    rm "${NXF_INSTANCE_RUNNING}"
+    mv "${params_file}.RUNNING" "${params_file}.ERROR"
+
+    echo "EMERGENCY_CLEAN_UP: Removing FIFOs..."                                | tee -a "${NXF_INSTANCE_ERROR}"
+    rm -f "${FIFO_STDOUT}" "${FIFO_STDERR}"
+
+    echo "EMERGENCY_CLEAN_UP: Bye."                                             | tee -a "${NXF_INSTANCE_ERROR}"
+    exit 1
+}
+
+SELF_SCRIPT_NAME=$(basename "$0")
+#####################################################
+## let's check where we are
+if [ -z "${DRAGEN_IGG_DIR}" ]; then
+    DRAGEN_IGG_DIR=$(dirname "$(realpath "${BASH_SOURCE[0]}")")
+fi
+#####################################################
+## let's check who we are
+if [[ "$(whoami)" != 'my_org_bioinfoadmin' ]]
+then
+	echo "ERROR: You must run this script as my_org_bioinfoadmin user!" >&2
+	exit 1;
+fi
+#####################################################
+## need to get the param-file from the ARGS
+while [[ "$#" -gt 0 ]]; do
+    if [[ "$1" == "-params-file" ]]; then
+        if [[ -n "$2" ]]; then
+            params_file="$2"
+            break
+        else
+            echo "ERROR : no file found after [-params-file] argument" >&2
+            exit 1
+        fi
+    fi
+    shift
+done
+#####################################################
+## Check if the param-file exists, is readable, and is not empty
+if [[ -n "${params_file}" ]]; then
+    if [[ -f "${params_file}" && -r "${params_file}" && -s "${params_file}" ]]; then
+        echo "" > /dev/null
+    else
+        echo "ERROR: The file [${params_file}] does not exist, is not readable, or is empty." >&2
+        exit 1
+    fi
+else
+    echo "ERROR: No parameters [-params-file] was found or specified." >&2
+    exit 1
+fi
+#####################################################
+## Check if the param-file have already been processed before
+if ls "${params_file}."* 1> /dev/null 2>&1; then
+    echo "ERROR: a param-file [${params_file}.*] FLAG have been detected. Can not continue." >&2
+    exit 1
+fi
+#####################################################
+# loading env variables 
+if [[ $(pwd) =~ [Tt][Ee][Ss][Tt][Ss]? ]]; then
+    source "${DRAGEN_IGG_DIR}/assets/tests.env"
+    echo "-------------------------------------"
+    echo "TEST MODE (because of location [$(pwd)]): "
+    ansi_mode="true"
+else
+    source "${DRAGEN_IGG_DIR}/assets/production.env"
+    ansi_mode="false"
+fi
+#####################################################
+## just some ENV verifications
+env_vars=("DATA_ROOT_PATH" "OUTPUT_REPO" "DO_CLEANUP" "APPLICATION_NEXTFLOW_DATA_PATH")
+for var in "${env_vars[@]}"; do
+    if [ -z "${!var}" ]; then
+        echo "ERROR: environment variable '${var}' is not correctly initialized. Contact the administrator." >&2
+        exit 1
+    else
+        echo -e "\t${var}=[${!var}]"
+    fi
+done
+#####################################################
+## configure some variables for NEXTFLOW
+# shellcheck disable=SC2155
+if [ -z "${TODAY}" ]; then
+    export TODAY=$(date +"%Y%m%d_%H%M%S")
+fi
+yaml_filename=$(basename "${params_file}" ".gvcfs.list.yaml")
+export NXF_OFFLINE=true
+export NXF_DISABLE_CHECK_LATEST=true
+export NXF_ANSI_LOG=true
+export NXF_HOME="/mnt/ngsdata/MY_ORG_WORKDIR/my_org_bioinfoadmin/NXF/NXF_HOME"
+export NXF_TEMP="/mnt/ngsdata/MY_ORG_WORKDIR/my_org_bioinfoadmin/NXF/NXF_TEMP"
+export NXF_WORK="${APPLICATION_NEXTFLOW_DATA_PATH}/WORKDIR"
+export NXF_CACHE_DIR="${APPLICATION_NEXTFLOW_DATA_PATH}/CACHEDIR-${yaml_filename}-$$"
+if [[ -z "${SUFFIX_LOGS_PATH}" ]]; then
+    SUFFIX_LOGS_PATH="${SELF_SCRIPT_NAME}/INSTANCE-${TODAY}"
+fi
+export INSTANCE_DIR="${LOGS_ROOT_PATH}/${SUFFIX_LOGS_PATH}"
+mkdir -p "${INSTANCE_DIR}"
+export NXF_LOG_FILE="${INSTANCE_DIR}/${SELF_SCRIPT_NAME}-${yaml_filename}.nextflow.log"
+export NXF_INSTANCE_RUNNING="${INSTANCE_DIR}/${SELF_SCRIPT_NAME}-${yaml_filename}.RUNNING"
+export NXF_INSTANCE_OK="${INSTANCE_DIR}/${SELF_SCRIPT_NAME}-${yaml_filename}.OK"
+export NXF_INSTANCE_ERROR="${INSTANCE_DIR}/${SELF_SCRIPT_NAME}-${yaml_filename}.ERROR"
+#####################################################
+source /etc/profile.d/modules.sh
+module load nextflow/24.04.1
+#####################################################
+## now we can execute
+echo "-------------------------------------"                | tee -a "${NXF_INSTANCE_RUNNING}"
+echo ""                                                     | tee -a "${NXF_INSTANCE_RUNNING}"
+echo "LOGS:"                                                | tee -a "${NXF_INSTANCE_RUNNING}"
+echo -e "\tNXF_WORK=[${NXF_WORK}]"                          | tee -a "${NXF_INSTANCE_RUNNING}"
+echo -e "\tNXF_CACHE_DIR=[${NXF_CACHE_DIR}]"                | tee -a "${NXF_INSTANCE_RUNNING}"
+echo -e "\tNXF_LOG_FILE=[${NXF_LOG_FILE}]"                  | tee -a "${NXF_INSTANCE_RUNNING}"
+echo ""                                                     | tee -a "${NXF_INSTANCE_RUNNING}"
+echo "-------------------------------------"                | tee -a "${NXF_INSTANCE_RUNNING}"
+echo ""                                                     | tee -a "${NXF_INSTANCE_RUNNING}"
+echo "PARAMS: "                                             | tee -a "${NXF_INSTANCE_RUNNING}"
+echo -e "\t-params-file\tNEXTFLOW_YAML file\tMANDATORY"     | tee -a "${NXF_INSTANCE_RUNNING}"
+echo "USER PARAMS: "                                        | tee -a "${NXF_INSTANCE_RUNNING}"
+echo -e "\t $*"                                             | tee -a "${NXF_INSTANCE_RUNNING}"
+echo "-------------------------------------"                | tee -a "${NXF_INSTANCE_RUNNING}"
+#####################################################
+# trap interuptions
+trap cleanup SIGINT SIGTERM SIGHUP
+#####################################################
+# Generate unique identifiers for FIFOs
+FIFO_STDOUT=/tmp/nxf_stdout_$$.fifo
+FIFO_STDERR=/tmp/nxf_stderr_$$.fifo
+#####################################################
+# Create FIFOs for capturing stdout and stderr
+mkfifo "${FIFO_STDOUT}" "${FIFO_STDERR}"
+#####################################################
+# Create the running flag file
+touch "${NXF_INSTANCE_RUNNING}"
+touch "${params_file}.RUNNING"
+#####################################################
+# Save the command
+echo "COMMAND:"                                         | tee -a "$NXF_INSTANCE_RUNNING"
+echo -e "nextflow run ${DRAGEN_IGG_DIR}/main.nf \n\t--strict -profile cluster -ansi-log ${ansi_mode} \n\t$*" | tee -a "${NXF_INSTANCE_RUNNING}"
+echo "-------------------------------------"            | tee -a "$NXF_INSTANCE_RUNNING"
+#####################################################
+# launching nextflow in bg and get PID
+nextflow run "${DRAGEN_IGG_DIR}/main.nf" \
+    --strict \
+    -profile cluster \
+    -ansi-log ${ansi_mode} \
+    "${@}" > "${FIFO_STDOUT}" 2> "${FIFO_STDERR}" &
+NEXTFLOW_PID=$!
+#####################################################
+# Start tee in the background and save their PIDs
+tee -a "${NXF_INSTANCE_RUNNING}" < "${FIFO_STDOUT}" & TEEPID1=$!
+tee -a "${NXF_INSTANCE_RUNNING}" < "${FIFO_STDERR}" >&2 & TEEPID2=$!
+#####################################################
+# wait for the nextflow PID
+wait ${NEXTFLOW_PID}
+#####################################################
+# got it and save it
+NEXTFLOW_EXIT_CODE=$?
+#####################################################
+# Cleanup FIFOs
+rm "${FIFO_STDOUT}" "${FIFO_STDERR}"
+#####################################################
+# Save the NXF exit_code
+echo "EXIT_CODE=${NEXTFLOW_EXIT_CODE}"                  | tee -a "${NXF_INSTANCE_RUNNING}"
+#####################################################
+# now have to share the status
+if [ ${NEXTFLOW_EXIT_CODE} -eq 0 ]; then
+    cat "${NXF_INSTANCE_RUNNING}" > "${NXF_INSTANCE_OK}"
+    mv "${params_file}.RUNNING" "${params_file}.OK"
+    echo "INFO: DRAGEN-IGG OK"
+    echo "INFO: logs in [${NXF_INSTANCE_OK}]"
+else
+    cat "${NXF_INSTANCE_RUNNING}" > "${NXF_INSTANCE_ERROR}"
+    mv "${params_file}.RUNNING" "${params_file}.ERROR"
+    echo "INFO: DRAGEN-IGG ERROR"
+    echo "INFO: logs in [${NXF_INSTANCE_OK}]"
+fi
+#####################################################
+## and clean
+rm "${NXF_INSTANCE_RUNNING}"

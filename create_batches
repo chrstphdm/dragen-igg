@@ -1,0 +1,164 @@
+#!/bin/bash
+set -o pipefail
+############################################################
+##
+# DESCRIPTION
+#
+## This script is a wrapper for the batch_creator.pl script.
+## Some defaults ENV variables are loaded dependantly of the place
+## where it is launched (TEST|PROD). 
+## PREAGG_DIR folder is scanned looking for UUID with QC_[OK|FORCED]
+## tags and not already in COHORT(s).
+#
+#
+# INPUT
+#
+## * --force -c COHORT_NAME ; OPTIONNAL
+## * --samples_list SAMPLES_LIST ; OPTIONNAL
+#
+#
+# OUTPUT
+#
+## * creation of OUTPUT_BATCHES_DIR : $output_directory/$cohort/CONFIG/BATCHES
+## * creation of Batch_(\d+)\.gvcfs.list in OUTPUT_BATCHES_DIR
+## * creation of OUTPUT_NXF_YAML_DIR : $output_directory/$cohort/CONFIG/NEXTFLOW_YAML
+## * creation of Batch_(\d+)\.gvcfs.list.yaml in OUTPUT_NXF_YAML_DIR
+#
+############################################################
+
+
+#####################################################
+## this is the function called if a signal is trapped
+cleanup() {
+    #####################################################
+    echo "EMERGENCY_CLEAN_UP: User interruption detected..."                    | tee -a "${INSTANCE_RUNNING}"
+    echo "EMERGENCY_CLEAN_UP: Cleaning perl **batch_creator.pl** process..."    | tee -a "${INSTANCE_RUNNING}"
+    kill -SIGTERM "${BATCH_CREATOR_PID}"
+    echo "EMERGENCY_CLEAN_UP: Waiting to close the stdout/err..."               | tee -a "${INSTANCE_RUNNING}"
+    wait "${TEEPID1}" "${TEEPID2}"
+
+    echo "EMERGENCY_CLEAN_UP: Creating error flag..."                           | tee -a "${INSTANCE_RUNNING}"
+    mv "${INSTANCE_RUNNING}" "${INSTANCE_ERROR}"
+
+    echo "EMERGENCY_CLEAN_UP: Removing FIFOs..."                                | tee -a "${INSTANCE_ERROR}"
+    rm -f "${FIFO_STDOUT}" "${FIFO_STDERR}"
+
+    echo "EMERGENCY_CLEAN_UP: Bye."                                             | tee -a "${INSTANCE_ERROR}"
+    exit 1
+}
+
+SELF_SCRIPT_NAME=$(basename "$0")
+#####################################################
+## let's check who we are
+if [[ "$(whoami)" != 'my_org_bioinfoadmin' ]]
+then
+	echo "ERROR: You must run this script as my_org_bioinfoadmin user!" >&2
+	exit 1;
+fi
+#####################################################
+## let's check where we are
+if [ -z "${DRAGEN_IGG_DIR}" ]; then
+    DRAGEN_IGG_DIR=$(dirname "$(realpath "${BASH_SOURCE[0]}")")
+fi
+#####################################################
+# loading env variables 
+if [[ $(pwd) =~ [Tt][Ee][Ss][Tt][Ss]? ]]; then
+    source "${DRAGEN_IGG_DIR}/assets/tests.env"
+    echo "-------------------------------------"
+    echo "TEST MODE (because of location [$(pwd)]): "
+else
+    source "${DRAGEN_IGG_DIR}/assets/production.env"
+fi
+#####################################################
+## just some verifications
+env_vars=("DATA_ROOT_PATH" "OUTPUT_REPO" "PREAGG_DIR" "AGG_DIR" "BATCH_SIZE" "LOGS_ROOT_PATH")
+for var in "${env_vars[@]}"; do
+    if [ -z "${!var}" ]; then
+        echo "ERROR: environment variable '${var}' is not correctly initialized. Contact the administrator." >&2
+        exit 1
+    else
+        echo -e "\t${var}\t\t[${!var}]"
+    fi
+done
+#####################################################
+# shellcheck disable=SC2155
+export TODAY=$(date +"%Y%m%d_%H%M%S")
+export INSTANCE_PATH="${LOGS_ROOT_PATH}/${SELF_SCRIPT_NAME}"
+#####################################################
+## need a place to save the logs
+if [[ ! -d "${INSTANCE_PATH}" ]]; then
+    echo "ERROR: [${INSTANCE_PATH}] must exists. Can not continue." >&2
+    exit 1
+fi
+#####################################################
+## now, we can set the variables names
+export INSTANCE_RUNNING="${INSTANCE_PATH}/${TODAY}.RUNNING"
+export INSTANCE_OK="${INSTANCE_PATH}/${TODAY}.OK"
+export INSTANCE_ERROR="${INSTANCE_PATH}/${TODAY}.ERROR"
+#####################################################
+## will not launch anything if an INSTANCE is RUNNING
+if ls "${INSTANCE_PATH}"/*".RUNNING" 1> /dev/null 2>&1; then
+    echo "ERROR: a RUNNING INSTANCE [${INSTANCE_PATH}/*.RUNNING] have been detected. Can not continue." >&2
+    exit 1
+fi
+touch "$INSTANCE_RUNNING"
+#####################################################
+## now we can execute
+echo "-------------------------------------"                | tee -a "$INSTANCE_RUNNING"
+echo "LOGS:"                                                | tee -a "$INSTANCE_RUNNING"
+echo -e "\tINSTANCE_LOG     [${INSTANCE_PATH}/${TODAY}.*]"  | tee -a "$INSTANCE_RUNNING"
+echo "-------------------------------------"                | tee -a "$INSTANCE_RUNNING"
+echo "PARAMS: "                                             | tee -a "$INSTANCE_RUNNING"
+echo -e "\t input           [${PREAGG_DIR}]"                | tee -a "$INSTANCE_RUNNING"
+echo -e "\t output          [${AGG_DIR}]"                   | tee -a "$INSTANCE_RUNNING"
+echo -e "\t batch_size      [${BATCH_SIZE}]"                | tee -a "$INSTANCE_RUNNING"
+echo "USER PARAMS: "                                        | tee -a "$INSTANCE_RUNNING"
+echo -e "\t $*"                                             | tee -a "$INSTANCE_RUNNING"
+echo "-------------------------------------"                | tee -a "$INSTANCE_RUNNING"
+#####################################################
+# trap interuptions
+trap cleanup SIGINT SIGTERM
+#####################################################
+# Generate unique identifiers for FIFOs
+FIFO_STDOUT=/tmp/nxf_stdout_$$.fifo
+FIFO_STDERR=/tmp/nxf_stderr_$$.fifo
+#####################################################
+# Create FIFOs for capturing stdout and stderr
+mkfifo "${FIFO_STDOUT}" "${FIFO_STDERR}"
+echo "COMMAND:"            | tee -a "$INSTANCE_RUNNING"
+echo -e "\t${DRAGEN_IGG_DIR}/scripts/batch_creator.pl \n\t--input \"${PREAGG_DIR}\" \n\t--output \"${AGG_DIR}\" \n\t--batch_size \"${BATCH_SIZE}\" \n\t$*" | tee -a "$INSTANCE_RUNNING"
+echo "-------------------------------------"            | tee -a "$INSTANCE_RUNNING"
+#####################################################
+# launching PERL
+"${DRAGEN_IGG_DIR}/scripts/batch_creator.pl" \
+    --input "${PREAGG_DIR}" \
+    --output "${AGG_DIR}" \
+    --batch_size "${BATCH_SIZE}" "${@}" > "${FIFO_STDOUT}" 2> "${FIFO_STDERR}" &
+BATCH_CREATOR_PID=$!
+#####################################################
+# Start tee in the background and save their PIDs
+tee -a "${INSTANCE_RUNNING}" < "${FIFO_STDOUT}" & TEEPID1=$!
+tee -a "${INSTANCE_RUNNING}" < "${FIFO_STDERR}" >&2 & TEEPID2=$!
+#####################################################
+# wait for the perl PID
+wait ${BATCH_CREATOR_PID}
+#####################################################
+# got it and save it
+BATCH_CREATOR_EXIT_CODE=$?
+#####################################################
+# Cleanup FIFOs
+rm "${FIFO_STDOUT}" "${FIFO_STDERR}"
+#####################################################
+# Save the NXF exit_code
+echo "EXIT_CODE=${BATCH_CREATOR_EXIT_CODE}" >> "${INSTANCE_RUNNING}"
+#####################################################
+# now have to share
+if [ $BATCH_CREATOR_EXIT_CODE -eq 0 ]; then
+    mv "$INSTANCE_RUNNING" "$INSTANCE_OK"
+    echo "INFO: BATCH-CREATOR OK"
+    echo "INFO: logs in [${INSTANCE_OK}]"
+else
+    mv "$INSTANCE_RUNNING" "$INSTANCE_ERROR"
+    echo "INFO: BATCH-CREATOR ERROR"
+    echo "INFO: logs in [${INSTANCE_ERROR}]"
+fi

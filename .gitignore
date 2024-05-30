@@ -1,0 +1,9 @@
+.nextflow*
+work
+logs
+data
+test
+TEST*
+reports*
+bin/PRODUCTION
+releases/*.gz
